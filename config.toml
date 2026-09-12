@@ -1,0 +1,28 @@
+[forecast]
+history_days = 90
+n_samples = 1000
+horizon_days = 60
+seed = 42
+
+[obligations]
+lookahead_days = 60
+safety_margin = 0.05
+
+[execution]
+settlement_lag_days = 2
+min_trade_value = 500
+txn_cost_bps = 5
+lot_selection = "FIFO"
+
+[regime_break]
+z_score_threshold = 3.0
+interval_widen_factor = 1.5
+
+[metrics]
+expose_missed_obligations = true
+expose_p90_coverage = true
+expose_reconciliation_diff = true
+
+[server]
+host = "0.0.0.0"
+port = 8000
