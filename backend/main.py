@@ -18,6 +18,8 @@ from config import load_config
 from state import STATE
 from engine.ingest import ingest, cancel_reversals
 from engine.forecast import forecast as run_forecast
+from engine.obligations import build_obligations, compute_safe_investable
+from engine.execution import execute, reconcile, detect_regime_break
 
 
 _START_TIME = time.time()
@@ -32,7 +34,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FS-2603 — Obligation-Safe Automated Investing",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -54,7 +56,7 @@ def healthz() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "fs-2603",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "uptime_seconds": round(time.time() - _START_TIME, 2),
     }
 
@@ -89,7 +91,7 @@ def reset() -> dict[str, str]:
 
 
 # ─────────────────────────────────────────────────────────
-# Forecast (Phase B — live)
+# Forecast
 # ─────────────────────────────────────────────────────────
 
 class ForecastRequest(BaseModel):
@@ -101,46 +103,80 @@ class ForecastRequest(BaseModel):
 
 @app.post("/forecast")
 def forecast_endpoint(req: ForecastRequest) -> dict[str, Any]:
-    # 1. Ingest and clean the raw rows
-    txns = ingest(req.transactions)
-    txns = cancel_reversals(txns)
-
-    # 2. Determine start date
+    txns = cancel_reversals(ingest(req.transactions))
     start = req.start_date or _date.today().isoformat()
-
-    # 3. Run the forecast
     result = run_forecast(
         txns,
         start=start,
         horizon_days=req.horizon_days,
         regime_widen=req.regime_widen,
     )
-
     result["transactions_ingested"] = len(txns)
     result["transactions_raw"] = len(req.transactions)
     return result
 
 
 # ─────────────────────────────────────────────────────────
-# Invest / Reconcile (Phase C — still stubs)
+# Invest (now live)
 # ─────────────────────────────────────────────────────────
 
 class InvestRequest(BaseModel):
     current_balance: float
+    today: str | None = None
     obligations: list[dict] = []
-    forecast: dict = {}
+    forecast_days: list[dict] = []
 
 
 @app.post("/invest")
 def invest(req: InvestRequest) -> dict[str, Any]:
-    return {"status": "stub", "message": "Phase C", "trades": [], "reserved": 0.0}
+    today = req.today or _date.today().isoformat()
+
+    # Reset state for this run and set opening cash
+    STATE.reset()
+    STATE.set_cash(req.current_balance)
+
+    # Build obligation register
+    obligations = build_obligations(req.obligations)
+    for o in obligations:
+        STATE.add_obligation(o)
+
+    # Compute safe investable amount via binary search on the guard
+    investable = compute_safe_investable(
+        req.current_balance, req.forecast_days, obligations, today
+    )
+
+    # Execute
+    result = execute(investable, today, req.forecast_days, obligations)
+    return {
+        "today": today,
+        "opening_cash": req.current_balance,
+        "safe_investable": investable,
+        **result,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# Reconcile
+# ─────────────────────────────────────────────────────────
+
+class ReconcileRequest(BaseModel):
+    opening_cash: float
 
 
 @app.post("/reconcile")
-def reconcile() -> dict[str, Any]:
-    snap = STATE.snapshot()
-    return {
-        "status": "stub",
-        "missed_obligations": snap["missed_obligations"],
-        "reconciliation_diff": snap["reconciliation_diff"],
-    }
+def reconcile_endpoint(req: ReconcileRequest) -> dict[str, Any]:
+    return reconcile(req.opening_cash)
+
+
+# ─────────────────────────────────────────────────────────
+# Regime break detection
+# ─────────────────────────────────────────────────────────
+
+class RegimeCheckRequest(BaseModel):
+    recent_credits: list[float] = []
+    historical_credits: list[float] = []
+
+
+@app.post("/regime-check")
+def regime_check(req: RegimeCheckRequest) -> dict[str, Any]:
+    return detect_regime_break(req.recent_credits, req.historical_credits)
