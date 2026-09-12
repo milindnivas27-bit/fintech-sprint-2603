@@ -21,6 +21,7 @@ from engine.forecast import forecast as run_forecast
 from engine.obligations import build_obligations, compute_safe_investable
 from engine.execution import execute, reconcile, detect_regime_break
 from profiles import list_profile_summaries, get_profile
+from db import init_db, log_run, list_runs, get_run, stats as db_stats
 
 
 _START_TIME = time.time()
@@ -30,12 +31,13 @@ _PROCESS = psutil.Process(os.getpid())
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_config(force_reload=True)
+    init_db()
     yield
 
 
 app = FastAPI(
     title="FS-2603 — Obligation-Safe Automated Investing",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -57,7 +59,7 @@ def healthz() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "fs-2603",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "uptime_seconds": round(time.time() - _START_TIME, 2),
     }
 
@@ -92,18 +94,41 @@ def reset() -> dict[str, str]:
 
 
 # ─────────────────────────────────────────────────────────
+# Database endpoints
+# ─────────────────────────────────────────────────────────
+
+@app.get("/runs")
+def runs_endpoint(limit: int = 50) -> dict[str, Any]:
+    """Recent pipeline runs from the audit database."""
+    return {"runs": list_runs(limit)}
+
+
+@app.get("/runs/{run_id}")
+def run_detail(run_id: int) -> dict[str, Any]:
+    """Full record of a single run, including trades and obligations."""
+    r = get_run(run_id)
+    if not r:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    return r
+
+
+@app.get("/db-stats")
+def db_stats_endpoint() -> dict[str, Any]:
+    """Aggregate stats across every logged run."""
+    return db_stats()
+
+
+# ─────────────────────────────────────────────────────────
 # Profiles
 # ─────────────────────────────────────────────────────────
 
 @app.get("/profiles")
 def profiles() -> dict[str, Any]:
-    """List the preloaded household scenarios."""
     return {"profiles": list_profile_summaries()}
 
 
 @app.get("/profiles/{profile_id}")
 def profile_detail(profile_id: str) -> dict[str, Any]:
-    """Full scenario — transactions, obligations, opening balance."""
     p = get_profile(profile_id)
     if not p:
         raise HTTPException(status_code=404, detail=f"Profile '{profile_id}' not found")
@@ -137,7 +162,7 @@ def forecast_endpoint(req: ForecastRequest) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────
-# Invest / Reconcile / Regime
+# Invest + persist
 # ─────────────────────────────────────────────────────────
 
 class InvestRequest(BaseModel):
@@ -145,6 +170,7 @@ class InvestRequest(BaseModel):
     today: str | None = None
     obligations: list[dict] = []
     forecast_days: list[dict] = []
+    profile_id: str | None = None
 
 
 @app.post("/invest")
@@ -163,13 +189,41 @@ def invest(req: InvestRequest) -> dict[str, Any]:
     )
 
     result = execute(investable, today, req.forecast_days, obligations)
+
+    # Persist to database
+    fc_summary = {}
+    if req.forecast_days:
+        last = req.forecast_days[-1]
+        fc_summary = {
+            "p10_end": last.get("p10", 0),
+            "p50_end": last.get("p50", 0),
+            "p90_end": last.get("p90", 0),
+        }
+
+    run_id = log_run(
+        profile_id=req.profile_id,
+        opening_cash=req.current_balance,
+        safe_investable=investable,
+        deployed=result["deployed"],
+        remaining_cash=result["remaining_cash"],
+        reconciliation_diff_paisa=0.0,
+        trades=result["trades"],
+        forecast_summary=fc_summary,
+        obligations=req.obligations,
+    )
+
     return {
+        "run_id": run_id,
         "today": today,
         "opening_cash": req.current_balance,
         "safe_investable": investable,
         **result,
     }
 
+
+# ─────────────────────────────────────────────────────────
+# Reconcile
+# ─────────────────────────────────────────────────────────
 
 class ReconcileRequest(BaseModel):
     opening_cash: float
@@ -179,6 +233,10 @@ class ReconcileRequest(BaseModel):
 def reconcile_endpoint(req: ReconcileRequest) -> dict[str, Any]:
     return reconcile(req.opening_cash)
 
+
+# ─────────────────────────────────────────────────────────
+# Regime break
+# ─────────────────────────────────────────────────────────
 
 class RegimeCheckRequest(BaseModel):
     recent_credits: list[float] = []

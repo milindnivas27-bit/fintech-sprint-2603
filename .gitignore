@@ -238,3 +238,6 @@ secrets.json
 
 # Docker
 *.pid
+
+*.db
+*.db-journal
