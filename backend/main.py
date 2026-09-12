@@ -10,7 +10,7 @@ import os
 import time
 
 import psutil
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -20,6 +20,7 @@ from engine.ingest import ingest, cancel_reversals
 from engine.forecast import forecast as run_forecast
 from engine.obligations import build_obligations, compute_safe_investable
 from engine.execution import execute, reconcile, detect_regime_break
+from profiles import list_profile_summaries, get_profile
 
 
 _START_TIME = time.time()
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FS-2603 — Obligation-Safe Automated Investing",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -56,7 +57,7 @@ def healthz() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "fs-2603",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "uptime_seconds": round(time.time() - _START_TIME, 2),
     }
 
@@ -91,6 +92,25 @@ def reset() -> dict[str, str]:
 
 
 # ─────────────────────────────────────────────────────────
+# Profiles
+# ─────────────────────────────────────────────────────────
+
+@app.get("/profiles")
+def profiles() -> dict[str, Any]:
+    """List the preloaded household scenarios."""
+    return {"profiles": list_profile_summaries()}
+
+
+@app.get("/profiles/{profile_id}")
+def profile_detail(profile_id: str) -> dict[str, Any]:
+    """Full scenario — transactions, obligations, opening balance."""
+    p = get_profile(profile_id)
+    if not p:
+        raise HTTPException(status_code=404, detail=f"Profile '{profile_id}' not found")
+    return p
+
+
+# ─────────────────────────────────────────────────────────
 # Forecast
 # ─────────────────────────────────────────────────────────
 
@@ -117,7 +137,7 @@ def forecast_endpoint(req: ForecastRequest) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────
-# Invest (now live)
+# Invest / Reconcile / Regime
 # ─────────────────────────────────────────────────────────
 
 class InvestRequest(BaseModel):
@@ -131,21 +151,17 @@ class InvestRequest(BaseModel):
 def invest(req: InvestRequest) -> dict[str, Any]:
     today = req.today or _date.today().isoformat()
 
-    # Reset state for this run and set opening cash
     STATE.reset()
     STATE.set_cash(req.current_balance)
 
-    # Build obligation register
     obligations = build_obligations(req.obligations)
     for o in obligations:
         STATE.add_obligation(o)
 
-    # Compute safe investable amount via binary search on the guard
     investable = compute_safe_investable(
         req.current_balance, req.forecast_days, obligations, today
     )
 
-    # Execute
     result = execute(investable, today, req.forecast_days, obligations)
     return {
         "today": today,
@@ -155,10 +171,6 @@ def invest(req: InvestRequest) -> dict[str, Any]:
     }
 
 
-# ─────────────────────────────────────────────────────────
-# Reconcile
-# ─────────────────────────────────────────────────────────
-
 class ReconcileRequest(BaseModel):
     opening_cash: float
 
@@ -167,10 +179,6 @@ class ReconcileRequest(BaseModel):
 def reconcile_endpoint(req: ReconcileRequest) -> dict[str, Any]:
     return reconcile(req.opening_cash)
 
-
-# ─────────────────────────────────────────────────────────
-# Regime break detection
-# ─────────────────────────────────────────────────────────
 
 class RegimeCheckRequest(BaseModel):
     recent_credits: list[float] = []
