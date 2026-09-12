@@ -1,0 +1,16 @@
+{
+  "determinism_ok": true,
+  "wall_ms_run1": 110.49,
+  "wall_ms_run2": 6.54,
+  "peak_ram_mb": 3.14,
+  "p10_end": -90912.04,
+  "p50_end": 51346.99,
+  "p90_end": 213836.02,
+  "band_width_end": 304748.06,
+  "investable": 103900.9,
+  "deployed": 103900.9,
+  "reconciliation_diff_paisa": 0.0,
+  "trades_committed": 3,
+  "trades_rejected": 0,
+  "calibration_coverage": 0.5
+}
